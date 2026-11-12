@@ -348,6 +348,10 @@ int main(int argc, char ** argv) {
                 }
 #if defined(__APPLE__)
                 const bool shared_memory = true;
+#elif defined(_WIN32)
+                // WDDM's GPU budget includes memory outside the CPU-visible RAM pool.
+                // Check the host and GPU budgets separately, even on an integrated GPU.
+                const bool shared_memory = false;
 #else
                 const bool shared_memory = type == GGML_BACKEND_DEVICE_TYPE_IGPU;
 #endif
