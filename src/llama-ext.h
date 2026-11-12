@@ -42,6 +42,9 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+bool llama_diffusion_reserve_buffers(
+        struct llama_model * model, int32_t prompt_capacity, int32_t canvas_length, bool use_f16);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

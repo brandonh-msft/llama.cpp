@@ -1,8 +1,10 @@
 #include "models.h"
 #include "gemma4-common.h"
+#include "../llama-ext.h"
 
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -695,55 +697,74 @@ static void dg_ensure_sc_embT(const llama_model_diffusion_gemma & m) {
 
     ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, /*.no_alloc =*/ true };
     m.sc_embT_ctx = ggml_init(ip);
-    GGML_ASSERT(m.sc_embT_ctx != nullptr);
-    m.sc_embT = ggml_new_tensor_2d(m.sc_embT_ctx, GGML_TYPE_F16, n_vocab, n_embd);
-    ggml_set_name(m.sc_embT, "sc_embT");
-
-    ggml_backend_dev_t dev = m.dev_layer(0);
-    ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
-    m.sc_embT_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.sc_embT_ctx, buft);
-    GGML_ASSERT(m.sc_embT_buf != nullptr);
-    ggml_backend_buffer_set_usage(m.sc_embT_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    // dequantize each row on the host and scatter the transpose into F16
-    const ggml_type st       = src->type;
-    const size_t    row_size = ggml_row_size(st, n_embd);
-    std::vector<char> host_src((size_t) row_size * n_vocab);
-    ggml_backend_tensor_get(src, host_src.data(), 0, host_src.size());
-
-    std::vector<ggml_fp16_t> dstT((size_t) n_vocab * n_embd);
-    const ggml_type_traits * tr = ggml_get_type_traits(st);
-
-    const unsigned hw  = std::thread::hardware_concurrency();
-    const unsigned nth = std::max(1u, std::min(hw ? hw : 1u, 32u));
-    auto worker = [&](int64_t v0, int64_t v1) {
-        std::vector<float> tmp(n_embd);
-        for (int64_t v = v0; v < v1; ++v) {
-            const char * row = host_src.data() + (size_t) v * row_size;
-            if (st == GGML_TYPE_F32) {
-                std::memcpy(tmp.data(), row, (size_t) n_embd * sizeof(float));
-            } else {
-                tr->to_float(row, tmp.data(), n_embd);
-            }
-            for (int64_t e = 0; e < n_embd; ++e) {
-                dstT[(size_t) e * n_vocab + v] = ggml_fp32_to_fp16(tmp[e]);
-            }
-        }
-    };
-    std::vector<std::thread> pool;
-    const int64_t chunk = (n_vocab + nth - 1) / nth;
-    for (unsigned t = 0; t < nth; ++t) {
-        const int64_t v0 = (int64_t) t * chunk;
-        const int64_t v1 = std::min(v0 + chunk, n_vocab);
-        if (v0 < v1) {
-            pool.emplace_back(worker, v0, v1);
-        }
+    if (!m.sc_embT_ctx) {
+        throw std::runtime_error("cannot allocate self-conditioning metadata");
     }
-    for (auto & th : pool) {
-        th.join();
-    }
+    try {
+        m.sc_embT = ggml_new_tensor_2d(m.sc_embT_ctx, GGML_TYPE_F16, n_vocab, n_embd);
+        ggml_set_name(m.sc_embT, "sc_embT");
 
-    ggml_backend_tensor_set(m.sc_embT, dstT.data(), 0, dstT.size() * sizeof(ggml_fp16_t));
+        ggml_backend_dev_t dev = m.dev_layer(0);
+        ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+        m.sc_embT_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.sc_embT_ctx, buft);
+        if (!m.sc_embT_buf) {
+            throw std::runtime_error("cannot allocate self-conditioning embedding");
+        }
+        ggml_backend_buffer_set_usage(m.sc_embT_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        // dequantize each row on the host and scatter the transpose into F16
+        const ggml_type st       = src->type;
+        const size_t    row_size = ggml_row_size(st, n_embd);
+        std::vector<char> host_src((size_t) row_size * n_vocab);
+        ggml_backend_tensor_get(src, host_src.data(), 0, host_src.size());
+
+        std::vector<ggml_fp16_t> dstT((size_t) n_vocab * n_embd);
+        const ggml_type_traits * tr = ggml_get_type_traits(st);
+
+        const unsigned hw  = std::thread::hardware_concurrency();
+        const unsigned nth = std::max(1u, std::min(hw ? hw : 1u, 32u));
+        std::vector<std::vector<float>> tmp(nth, std::vector<float>((size_t) n_embd));
+        auto worker = [&](unsigned t, int64_t v0, int64_t v1) {
+            for (int64_t v = v0; v < v1; ++v) {
+                const char * row = host_src.data() + (size_t) v * row_size;
+                if (st == GGML_TYPE_F32) {
+                    std::memcpy(tmp[t].data(), row, (size_t) n_embd * sizeof(float));
+                } else {
+                    tr->to_float(row, tmp[t].data(), n_embd);
+                }
+                for (int64_t e = 0; e < n_embd; ++e) {
+                    dstT[(size_t) e * n_vocab + v] = ggml_fp32_to_fp16(tmp[t][e]);
+                }
+            }
+        };
+        std::vector<std::thread> pool;
+        pool.reserve(nth);
+        const int64_t chunk = (n_vocab + nth - 1) / nth;
+        try {
+            for (unsigned t = 0; t < nth; ++t) {
+                const int64_t v0 = (int64_t) t * chunk;
+                const int64_t v1 = std::min(v0 + chunk, n_vocab);
+                if (v0 < v1) {
+                    pool.emplace_back(worker, t, v0, v1);
+                }
+            }
+        } catch (...) {
+            for (auto & th : pool) {
+                th.join();
+            }
+            throw;
+        }
+        for (auto & th : pool) {
+            th.join();
+        }
+        ggml_backend_tensor_set(m.sc_embT, dstT.data(), 0, dstT.size() * sizeof(ggml_fp16_t));
+    } catch (...) {
+        if (m.sc_embT_buf) { ggml_backend_buffer_free(m.sc_embT_buf); m.sc_embT_buf = nullptr; }
+        ggml_free(m.sc_embT_ctx);
+        m.sc_embT_ctx = nullptr;
+        m.sc_embT = nullptr;
+        throw;
+    }
 }
 
 // Lazily (re)allocate the device prev-step canvas-logits buffer [n_vocab, C] F32 (grow-only) on layer-0's
@@ -755,10 +776,14 @@ static void dg_ensure_sc_dev(const llama_model_diffusion_gemma & m, int64_t C) {
     }
     if (m.sc_dev_buf) { ggml_backend_buffer_free(m.sc_dev_buf); m.sc_dev_buf = nullptr; }
     if (m.sc_dev_ctx) { ggml_free(m.sc_dev_ctx); m.sc_dev_ctx = nullptr; }
+    m.sc_dev = nullptr;
+    m.sc_dev_C = 0;
 
     ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, /*.no_alloc =*/ true };
     m.sc_dev_ctx = ggml_init(ip);
-    GGML_ASSERT(m.sc_dev_ctx != nullptr);
+    if (!m.sc_dev_ctx) {
+        throw std::runtime_error("cannot allocate self-conditioning metadata");
+    }
     m.sc_dev = ggml_new_tensor_2d(m.sc_dev_ctx, GGML_TYPE_F32, n_vocab, C);
     ggml_set_name(m.sc_dev, "sc_dev");
 
@@ -766,7 +791,12 @@ static void dg_ensure_sc_dev(const llama_model_diffusion_gemma & m, int64_t C) {
     ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev)
                                           : ggml_backend_cpu_buffer_type();
     m.sc_dev_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.sc_dev_ctx, buft);
-    GGML_ASSERT(m.sc_dev_buf != nullptr);
+    if (!m.sc_dev_buf) {
+        ggml_free(m.sc_dev_ctx);
+        m.sc_dev_ctx = nullptr;
+        m.sc_dev = nullptr;
+        throw std::runtime_error("cannot allocate self-conditioning logits");
+    }
     ggml_backend_buffer_clear(m.sc_dev_buf, 0);  // step-0 safety (see above)
     m.sc_dev_C = C;
 }
@@ -783,6 +813,7 @@ static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P
     if (m.pkv_ctx) { ggml_free(m.pkv_ctx); m.pkv_ctx = nullptr; }
     m.pkv_k.clear();
     m.pkv_v.clear();
+    m.pkv_cap = 0;
 
     const int     n_layer = (int) m.hparams.n_layer();
     const int64_t cap     = P;
@@ -793,7 +824,9 @@ static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P
         /*.no_alloc   =*/ true,
     };
     m.pkv_ctx = ggml_init(ip);
-    GGML_ASSERT(m.pkv_ctx != nullptr);
+    if (!m.pkv_ctx) {
+        throw std::runtime_error("cannot allocate prompt-KV metadata");
+    }
     m.pkv_k.resize(n_layer);
     m.pkv_v.resize(n_layer);
     for (int il = 0; il < n_layer; ++il) {
@@ -809,7 +842,13 @@ static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P
     ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev)
                                           : ggml_backend_cpu_buffer_type();
     m.pkv_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.pkv_ctx, buft);
-    GGML_ASSERT(m.pkv_buf != nullptr);
+    if (!m.pkv_buf) {
+        ggml_free(m.pkv_ctx);
+        m.pkv_ctx = nullptr;
+        m.pkv_k.clear();
+        m.pkv_v.clear();
+        throw std::runtime_error("cannot allocate prompt-KV store");
+    }
     m.pkv_cap = cap;
 }
 
@@ -827,6 +866,33 @@ size_t llama_diffusion_pkv_bytes_per_token(const struct llama_model * model, boo
         bytes += (size_t) dm->hparams.n_embd_head_k(il) * dm->hparams.n_head_kv(il) * 2 * elt; // K + V
     }
     return bytes;
+}
+
+ggml_backend_dev_t llama_diffusion_pkv_device(const struct llama_model * model) {
+    const auto * dm = dynamic_cast<const llama_model_diffusion_gemma *>(model);
+    if (!dm) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = dm->dev_layer(0);
+    return dev ? dev : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+}
+
+bool llama_diffusion_reserve_buffers(
+        struct llama_model * model, int32_t prompt_capacity, int32_t canvas_length, bool use_f16) {
+    auto * dm = dynamic_cast<llama_model_diffusion_gemma *>(model);
+    if (!dm || prompt_capacity <= 0 || canvas_length <= 0) {
+        return false;
+    }
+    try {
+        dg_ensure_sc_embT(*dm);
+        dg_ensure_pkv_store(*dm, prompt_capacity, use_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
+        ggml_backend_buffer_clear(dm->pkv_buf, 0);
+        dg_ensure_sc_dev(*dm, canvas_length);
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return false;
+    }
 }
 
 // Public API: select the prompt-KV-caching phase for the next llama_decode (no-op otherwise). UNIFIED =

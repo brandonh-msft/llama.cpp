@@ -646,6 +646,14 @@ extern "C" {
             const struct llama_model * model,
                               bool      use_f16);
 
+    // The persistent prompt-KV and device self-conditioning buffers use layer 0's device.
+    LLAMA_API ggml_backend_dev_t llama_diffusion_pkv_device(const struct llama_model * model);
+
+    // Reserve the cached prompt store, self-conditioning buffers, and peak prefill/decode graphs.
+    // max_context is the maximum requested prompt plus canvas length.
+    LLAMA_API bool llama_diffusion_reserve_runtime(
+            struct llama_context * ctx, int32_t max_context, int32_t canvas_length);
+
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);

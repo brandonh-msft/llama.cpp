@@ -990,6 +990,14 @@ ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
 
+void llama_context::update_compute_buffer_sizes() {
+    if (!model.no_alloc()) {
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        }
+    }
+}
+
 uint32_t llama_context::n_ctx() const {
     return cparams.n_ctx;
 }
@@ -4627,6 +4635,48 @@ struct ggml_cgraph * llama_graph_reserve(
         mctx = memory->init_full();
     }
     return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
+}
+
+bool llama_diffusion_reserve_runtime(struct llama_context * ctx, int32_t max_context, int32_t canvas_length) {
+    if (!ctx || canvas_length <= 0 || max_context <= canvas_length ||
+        (uint32_t) max_context > ctx->n_ctx() || ctx->n_ctx() > INT32_MAX) {
+        return false;
+    }
+
+    auto * model = const_cast<llama_model *>(&ctx->get_model());
+    if (model->arch != LLM_ARCH_DIFFUSION_GEMMA ||
+        !llama_diffusion_reserve_buffers(model, (int32_t) ctx->n_ctx(), canvas_length, ctx->get_cparams().flash_attn)) {
+        return false;
+    }
+
+    const int32_t prompt = max_context - canvas_length;
+    const int32_t chunk = std::min<int32_t>(prompt, ctx->n_ubatch());
+    if (chunk <= 0) {
+        return false;
+    }
+
+    llama_set_causal_attn(ctx, false);
+    llama_diffusion_set_device_sc(model, true);
+    bool ok = false;
+    try {
+        llama_diffusion_set_sc(model, nullptr, 0.0f, 1.0f, false);
+        llama_diffusion_set_phase(model, 1, prompt, prompt - chunk);
+        ok = llama_graph_reserve(ctx, chunk, 1, 1) != nullptr;
+        if (ok) {
+            llama_diffusion_set_sc(model, nullptr, 0.0f, 1.0f, true);
+            llama_diffusion_set_phase(model, 2, prompt, 0);
+            ok = llama_graph_reserve(ctx, canvas_length, 1, canvas_length) != nullptr;
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        ok = false;
+    }
+    llama_diffusion_set_phase(model, 0, 0, 0);
+    llama_diffusion_set_sc(model, nullptr, 0.0f, 1.0f, true);
+    if (ok) {
+        ctx->update_compute_buffer_sizes();
+    }
+    return ok;
 }
 
 // llama adapter API

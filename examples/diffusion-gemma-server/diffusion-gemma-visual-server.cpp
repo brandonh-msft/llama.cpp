@@ -30,6 +30,7 @@
 #include "common.h"
 #include "chat.h"
 #include "../diffusion/diffusion.h"
+#include "diffusion-context-sizing.h"
 
 #include "json.h"
 
@@ -41,6 +42,58 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+
+#ifdef __linux__
+static diffusion_context::file_status read_memory_file(const std::string & path, std::string & value) {
+    FILE * f = fopen(path.c_str(), "r");
+    if (!f) {
+        return errno == ENOENT ? diffusion_context::file_status::missing : diffusion_context::file_status::error;
+    }
+    value.clear();
+    char buffer[4096];
+    size_t n = 0;
+    while ((n = fread(buffer, 1, sizeof(buffer), f)) != 0) {
+        value.append(buffer, n);
+    }
+    const bool failed = ferror(f);
+    fclose(f);
+    return failed ? diffusion_context::file_status::error : diffusion_context::file_status::ok;
+}
+#endif
+
+static size_t available_host_memory([[maybe_unused]] size_t reported) {
+#ifdef __linux__
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    unsigned long long kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+    }
+    fclose(f);
+    if (!kb) return 0;
+    size_t available = (size_t) std::min<uint64_t>(diffusion_context::mul(kb, 1024), SIZE_MAX);
+    std::string groups, mounts;
+    if (read_memory_file("/proc/self/cgroup", groups) != diffusion_context::file_status::ok ||
+        read_memory_file("/proc/self/mountinfo", mounts) != diffusion_context::file_status::ok) return 0;
+    return (size_t) diffusion_context::cgroup_available(available, groups, mounts, read_memory_file);
+#elif defined(__APPLE__)
+    mach_port_t host = mach_host_self();
+    vm_size_t page_size = 0;
+    vm_statistics64_data_t stats;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    const bool ok = host_page_size(host, &page_size) == KERN_SUCCESS &&
+        host_statistics64(host, HOST_VM_INFO64, (host_info64_t) &stats, &count) == KERN_SUCCESS;
+    mach_port_deallocate(mach_task_self(), host);
+    return ok ? (size_t) (uint64_t(stats.free_count + stats.inactive_count) * page_size) : 0;
+#else
+    return reported;
+#endif
+}
 
 static std::string read_text_file(const std::string & path) {
     FILE * f = fopen(path.c_str(), "rb");
@@ -116,15 +169,22 @@ static int32_t meta_i(llama_model * m, const char * key, int32_t def) {
 int main(int argc, char ** argv) {
     // Callers probe this before handing the server more than one GPU: older builds abort on the first request
     // once the model is split (every [prompt|canvas] row asked for logits past the canvas-sized output cap).
-    if (argc == 2 && std::string(argv[1]) == "--capabilities") { printf("multi_gpu_split\n"); return 0; }
+    if (argc == 2 && std::string(argv[1]) == "--capabilities") { printf("multi_gpu_split exact_context_v1\n"); return 0; }
     if (argc < 2) { fprintf(stderr, "usage: %s <model.gguf>\n", argv[0]); return 1; }
-    // MAXTOK <= 0 (or unset) => auto-size: probe the largest non-causal ubatch that fits VRAM, else RAM.
-    const int MAXTOK_ENV = atoi(getenv("MAXTOK") ? getenv("MAXTOK") : "0");
+    // MAXTOK=0 (or unset) asks the server to auto-size.
+    int MAXTOK_ENV = 0;
+    if (!diffusion_context::parse_requested_context(getenv("MAXTOK"), MAXTOK_ENV)) {
+        fprintf(stderr, "DIFFUSION_CONTEXT_ERROR: MAXTOK must be a non-negative integer within the supported range.\n");
+        return 1;
+    }
 
     llama_backend_init();
     ggml_backend_load_all(); // load dynamic backends so NGL can offload to GPU
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = atoi(getenv("NGL") ? getenv("NGL") : "0");
+    const bool explicit_cpu_only = diffusion_context::explicit_cpu_only(MAXTOK_ENV, mparams.n_gpu_layers);
+    ggml_backend_dev_t no_gpu_devices[] = {nullptr};
+    if (explicit_cpu_only) mparams.devices = no_gpu_devices;
     llama_model * model = llama_model_load_from_file(argv[1], mparams);
     if (!model) { fprintf(stderr, "failed to load model\n"); return 1; }
     if (!llama_model_is_diffusion(model)) { fprintf(stderr, "not a diffusion model\n"); return 1; }
@@ -160,7 +220,7 @@ int main(int argc, char ** argv) {
             if (!gpu_dev) gpu_dev = d;
         }
     }
-    const bool one_gpu = (gpu_devs <= 1);
+    const bool one_gpu = diffusion_context::cached_attention_supported(gpu_devs, explicit_cpu_only);
 
     const bool fa_on  = getenv("FA") && atoi(getenv("FA"));
     const int  n_head = std::max(1, (int) llama_model_n_head(model));
@@ -169,7 +229,8 @@ int main(int argc, char ** argv) {
         c.n_ctx   = (uint32_t) n;
         c.n_batch = (uint32_t) n;
         // chunked causal prefill: keep n_head*chunk*n_kv under 2^31 (CUDA softcap is 32-bit indexed)
-        const int chunk = (int) std::clamp<int64_t>((int64_t(1) << 30) / (int64_t(n_head) * n), 256, 2048);
+        const int64_t padded = (int64_t(n) + 255) / 256 * 256;
+        const int chunk = (int) std::clamp<int64_t>((int64_t(1) << 30) / (int64_t(n_head) * padded), 256, 2048);
         // without the prompt-KV store (split over GPUs) each step encodes [prompt | canvas] as one ubatch
         c.n_ubatch = (uint32_t) (one_gpu ? std::min(n, chunk) : n);
         c.n_outputs_max = (uint32_t) canvas_length;   // only the canvas rows need logits
@@ -234,15 +295,82 @@ int main(int argc, char ** argv) {
     llama_context * ctx = nullptr;
     const char * reason = "auto";
 
-    if (MAXTOK_ENV > 0 && (one_gpu || MAXTOK_ENV <= split_ceil)) {   // explicit budget: honour exactly if it fits, else degrade through the probe
-        const double sc = (double) n_head * (double) MAXTOK_ENV * (double) MAXTOK_ENV * 4.0;
-        const size_t budget = std::max(v_free, ram_budget);
-        if (!budget || sc <= (double) budget * 0.9) {
-            ctx = llama_init_from_model(model, make_cparams(MAXTOK_ENV));
-            if (ctx) { MAXTOK = MAXTOK_ENV; reason = "requested"; }
+    if (MAXTOK_ENV > 0) {
+        if ((n_ctx_train > 0 && MAXTOK_ENV > n_ctx_train) || MAXTOK_ENV <= canvas_length) {
+            fprintf(stderr, "DIFFUSION_CONTEXT_ERROR: Requested context %d is outside this model's supported range (canvas %d, maximum %d).\n",
+                    MAXTOK_ENV, (int) canvas_length, n_ctx_train);
+            return 1;
         }
+        if (!one_gpu && !diffusion_context::fits_unsplit_attention(MAXTOK_ENV, n_head)) {
+            fprintf(stderr, "DIFFUSION_CONTEXT_ERROR: Requested context %d exceeds the %d-token limit for a multi-GPU diffusion model.\n",
+                    MAXTOK_ENV, (split_ceil / 256) * 256);
+            return 1;
+        }
+        ggml_backend_dev_t layer0 = llama_diffusion_pkv_device(model);
+        if (!layer0) {
+            fprintf(stderr, "DIFFUSION_CONTEXT_ERROR: Cannot determine the diffusion runtime's memory device.\n");
+            return 1;
+        }
+        const auto layer0_type = ggml_backend_dev_type(layer0);
+        const bool layer0_gpu = layer0_type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                                layer0_type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        const bool gpu_layers = gpu_dev && mparams.n_gpu_layers != 0;
+        const bool cpu_layers = !gpu_layers || !layer0_gpu ||
+            (mparams.n_gpu_layers >= 0 && mparams.n_gpu_layers < llama_model_n_layer(model));
+        const auto need = diffusion_context::estimate(
+            MAXTOK_ENV, n_head, llama_diffusion_pkv_bytes_per_token(model, fa_on),
+            n_vocab, llama_model_n_embd(model), canvas_length, one_gpu, layer0_gpu, cpu_layers, gpu_layers);
+        size_t host_free = available_host_memory(r_free);
+        if (const char * e = getenv("DG_FREE_RAM_MB")) {
+            host_free = std::min(host_free, (size_t) atoll(e) * 1024 * 1024);
+        }
+        if (!diffusion_context::fits(need.host, host_free)) {
+            fprintf(stderr, "DIFFUSION_CONTEXT_ERROR: Requested context %d needs approximately %zu MiB of available host memory; %zu MiB is available before headroom. Try a smaller context or more RAM.\n",
+                    MAXTOK_ENV, (size_t) (need.host / (1024 * 1024)), host_free / (1024 * 1024));
+            return 1;
+        }
+        if (gpu_layers) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                const auto type = ggml_backend_dev_type(dev);
+                if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                if (const char * e = getenv("DG_FREE_VRAM_MB")) {
+                    free = std::min(free, (size_t) atoll(e) * 1024 * 1024);
+                }
+                const uint64_t device_need = dev == layer0 ? need.device : need.workspace;
+                if (!diffusion_context::fits(device_need, free)) {
+                    fprintf(stderr, "DIFFUSION_CONTEXT_ERROR: Requested context %d needs approximately %zu MiB of free GPU memory on %s; %zu MiB is available before headroom. Try a smaller context or fewer GPU layers.\n",
+                            MAXTOK_ENV, (size_t) (device_need / (1024 * 1024)),
+                            ggml_backend_dev_name(dev), free / (1024 * 1024));
+                    return 1;
+                }
+#if defined(__APPLE__)
+                const bool shared_memory = true;
+#else
+                const bool shared_memory = type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+#endif
+                if (shared_memory && !diffusion_context::fits(diffusion_context::add(need.host, device_need), host_free)) {
+                    fprintf(stderr, "DIFFUSION_CONTEXT_ERROR: Requested context %d does not fit available shared memory with headroom.\n", MAXTOK_ENV);
+                    return 1;
+                }
+            }
+        }
+        ctx = llama_init_from_model(model, make_cparams(MAXTOK_ENV));
+        if (!ctx) {
+            fprintf(stderr, "DIFFUSION_CONTEXT_ERROR: Could not allocate the requested %d-token context. Try a smaller context or more memory.\n", MAXTOK_ENV);
+            return 1;
+        }
+        if (one_gpu && !llama_diffusion_reserve_runtime(ctx, MAXTOK_ENV, (int32_t) canvas_length)) {
+            fprintf(stderr, "DIFFUSION_CONTEXT_ERROR: Could not reserve runtime memory for the requested %d-token context. Try a smaller context or more memory.\n", MAXTOK_ENV);
+            llama_free(ctx);
+            return 1;
+        }
+        MAXTOK = MAXTOK_ENV;
+        reason = "requested";
     }
-    if (!ctx) {
+    if (!ctx && MAXTOK_ENV <= 0) {
         const int ceil_ctx = MAXTOK_ENV > 0 ? std::min(auto_ceil, MAXTOK_ENV) : auto_ceil;
         const size_t vram_headroom = v_total ? (size_t) (v_total * 0.08) : (size_t) 1536 * 1024 * 1024;
         int n1 = 0;
@@ -255,7 +383,7 @@ int main(int argc, char ** argv) {
             else if (c) { llama_free(c); }
         }
     }
-    if (!ctx) {   // last resort: the floor so a very tight machine still loads
+    if (!ctx && MAXTOK_ENV <= 0) {   // last resort: the floor so a very tight machine still loads
         int N = std::max((int) canvas_length, (int) ((floor_ctx / canvas_length) * canvas_length));
         ctx = llama_init_from_model(model, make_cparams(N));
         if (ctx) { MAXTOK = N; reason = "floor"; }

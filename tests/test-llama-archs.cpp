@@ -902,6 +902,80 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+static bool check_diffusion_runtime_reserve(llama_model * model) {
+    constexpr int32_t context = 256;
+    constexpr int32_t canvas = 16;
+    llama_diffusion_set_sc(model, nullptr, 0.0f, 1.0f, true);
+
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = context;
+    params.n_batch = context;
+    params.n_ubatch = 64;
+    params.n_outputs_max = canvas;
+    params.n_threads = 4;
+    params.n_threads_batch = 4;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    llama_context_ptr ctx(llama_init_from_model(model, params));
+    if (!ctx || llama_diffusion_reserve_runtime(ctx.get(), canvas, canvas) ||
+        llama_diffusion_reserve_runtime(ctx.get(), context + 1, canvas)) {
+        return false;
+    }
+
+    llama_set_causal_attn(ctx.get(), false);
+    auto decode = [&](int32_t prompt) {
+        std::vector<float> result;
+        common_batch batch(ctx.get());
+        llama_diffusion_set_sc(model, nullptr, 0.0f, 1.0f, false);
+        for (int32_t off = 0; off < prompt; off += 64) {
+            const int32_t count = std::min<int32_t>(64, prompt - off);
+            batch.clear();
+            llama_diffusion_set_phase(model, 1, prompt, off);
+            for (int32_t i = 0; i < count; ++i) {
+                batch.add((off + i) % 127, off + i, 0, i == count - 1);
+            }
+            if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                return result;
+            }
+        }
+        batch.clear();
+        llama_diffusion_set_phase(model, 2, prompt, 0);
+        for (int32_t i = 0; i < canvas; ++i) {
+            batch.add((i * 7) % 127, prompt + i, 0, true);
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            return result;
+        }
+        const int32_t vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        for (int32_t i = 0; i < canvas; ++i) {
+            const float * logits = llama_get_logits_ith(ctx.get(), i);
+            result.insert(result.end(), logits, logits + vocab);
+        }
+        return result;
+    };
+
+    const auto baseline = decode(40);
+    if (baseline.empty() || !llama_diffusion_reserve_runtime(ctx.get(), context, canvas)) {
+        return false;
+    }
+    const auto after_reserve = decode(40);
+    const auto longer = decode(context - canvas);
+    const auto after_longer = decode(40);
+    if (after_reserve.size() != baseline.size() || longer.size() != baseline.size() ||
+        after_longer.size() != baseline.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < baseline.size(); ++i) {
+        if (!std::isfinite(baseline[i]) || !std::isfinite(after_reserve[i]) ||
+            !std::isfinite(after_longer[i]) ||
+            std::abs(baseline[i] - after_reserve[i]) > 1e-5f ||
+            std::abs(baseline[i] - after_longer[i]) > 1e-5f) {
+            return false;
+        }
+    }
+    llama_diffusion_set_phase(model, 0, 0, 0);
+    return true;
+}
+
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
 // returns the llama_process() error code
 static int32_t get_logits_mixed(
@@ -1375,6 +1449,13 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         if (nmse_val > 1e-4) {
                             test_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
+                        }
+
+                        if (arch == LLM_ARCH_DIFFUSION_GEMMA && dc.devs.size() == 1 &&
+                            ggml_backend_dev_type(dc.devs[0]) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                            !check_diffusion_runtime_reserve(model_and_ctx_dev.first.get())) {
+                            test_ok = false;
+                            status_nmse = "\033[1;31mFAIL\033[0m (diffusion reserve)";
                         }
 
                         // chunked decode matches a single batch only with causal attention over a memory

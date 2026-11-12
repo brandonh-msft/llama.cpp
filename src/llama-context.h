@@ -64,6 +64,7 @@ struct llama_context {
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
+    void update_compute_buffer_sizes();
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
